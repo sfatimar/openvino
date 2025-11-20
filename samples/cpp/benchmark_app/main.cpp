@@ -694,6 +694,22 @@ int main(int argc, char* argv[]) {
 
             auto startTime = Time::now();
             auto model = core.read_model(FLAGS_m);
+            std::cout << "device name" << device_name << "\n";
+            auto supported_ops = core.query_model(model, device_name);
+
+            for (const std::shared_ptr<ov::Node>& node : model->get_ops()) {
+                std::cout << node->get_name() << " " << node->get_friendly_name() << "\t";
+                auto& affinity = supported_ops[node->get_friendly_name()];
+                // Store affinity mapping using op runtime information
+                if (node->get_friendly_name().find("GroupQueryAttention") != std::string::npos) {
+                    node->get_rt_info()["affinity"] = "CPU";
+                } else {
+                    node->get_rt_info()["affinity"] = "NPU";
+                }
+            }
+
+            std::cout << "model info end\n";
+
             auto duration_ms = get_duration_ms_till_now(startTime);
             slog::info << "Read model took " << double_to_string(duration_ms) << " ms" << slog::endl;
             slog::info << "Original model I/O parameters:" << slog::endl;
