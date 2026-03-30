@@ -269,8 +269,7 @@ const std::vector<std::string> get_supported_ops_via_tokenizers() {
     return {"StringNormalizer",
             "LabelEncoder",
             "Tokenizer",
-            "TfidVectorizer"};
-
+            "TfIdfVectorizer"};
 }
 #undef REGISTER_OPERATOR
 #undef REGISTER_OPERATOR_WITH_DOMAIN
