@@ -8,7 +8,6 @@ from common.layer_test_class import check_ir_version
 from common.onnx_layer_test_class import OnnxRuntimeLayerTest, onnx_make_model
 
 import onnx
-import openvino_tokenizers
 from onnx import helper, TensorProto
 
 
