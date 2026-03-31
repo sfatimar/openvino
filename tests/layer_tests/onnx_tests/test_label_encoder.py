@@ -17,7 +17,7 @@ rng = np.random.default_rng()
 
 class TestLabelEncoder(OnnxRuntimeLayerTest):
     def _prepare_input(self, inputs_info):
-    ￼    assert "input" in inputs_info
+        assert "input" in inputs_info
         input_shape = inputs_info["input"]
         inputs_data = {}
         sample_data = rng.choice(self.strings_dictionary, input_shape)
