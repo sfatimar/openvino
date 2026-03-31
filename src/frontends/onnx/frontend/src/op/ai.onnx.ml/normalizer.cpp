@@ -46,6 +46,12 @@ ov::OutputVector normalizer(const ov::frontend::onnx::Node& node) {
                       input.get_element_type());
 
      const auto normalization_type = node.get_attribute_value<std::string>("norm", "MAX");
+
+     CHECK_VALID_NODE(node, normalization_type == "MAX" ||
+                      normalization_type == "L1" ||
+                      normalization_type == "L2",
+                      "Normalization Mode should be either MAX, L1 or L2, got ",  normalization_type);
+
      auto float_input = std::make_shared<ov::op::v0::Convert>(input, ov::element::f32);
      const auto x = std::make_shared<ov::op::v0::Abs>(float_input);
      const auto axes = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {-1});  // e.g., last axis
