@@ -266,10 +266,7 @@ OperatorsBridge::OperatorsBridge() {
 }
 
 const std::vector<std::string> get_supported_ops_via_tokenizers() {
-    return {"StringNormalizer",
-            "LabelEncoder",
-            "Tokenizer",
-            "TfIdfVectorizer"};
+    return {"StringNormalizer", "LabelEncoder", "Tokenizer", "TfIdfVectorizer"};
 }
 #undef REGISTER_OPERATOR
 #undef REGISTER_OPERATOR_WITH_DOMAIN
