@@ -320,7 +320,12 @@ std::shared_ptr<ov::Model> FrontEnd::convert(const InputModel::Ptr& input_model)
     normalize(converted_model);
 
     const auto report = ov::frontend::collect_unconverted_ops(converted_model, make_onnx_extractor());
-    ov::frontend::check_unconverted_ops(report, m_extensions.telemetry, "onnx", "[ONNX Frontend] ", "", make_onnx_tokenizer_callback());
+    ov::frontend::check_unconverted_ops(report,
+                                        m_extensions.telemetry,
+                                        "onnx",
+                                        "[ONNX Frontend] ",
+                                        "",
+                                        make_onnx_tokenizer_callback());
 
     return converted_model;
 }
