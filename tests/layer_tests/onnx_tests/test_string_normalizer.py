@@ -30,7 +30,7 @@ class TestStringNormalizer(OnnxRuntimeLayerTest):
         # Store dictionary for use in _prepare_input
         self.strings_dictionary = strings_dictionary
 
-       # Create ONNX model
+        # Create ONNX model
         input_info = helper.make_tensor_value_info("input", TensorProto.STRING, shape)
         output_info = helper.make_tensor_value_info("output", TensorProto.STRING, shape)
 
