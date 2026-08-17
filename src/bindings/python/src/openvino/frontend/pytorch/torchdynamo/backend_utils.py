@@ -9,20 +9,26 @@ from openvino import Core
 
 
 def _get_device(options) -> Optional[Any]:
-    core = Core()
     device = "CPU"
 
     if options is not None and "device" in options:
         device = options["device"]
 
-    if device is not None:
-        assert device in core.available_devices, (
+    if device is None:
+        return "CPU"
+
+    # Validating the name against Core().available_devices enumerates *every*
+    # registered plugin, GPU and NPU included. On hosts with a broken or absent
+    # Level Zero driver that probe aborts the process inside zeInitDrivers --
+    # and a native abort cannot be caught, so guarding the call is not enough;
+    # it has to be skipped. CPU is always available and needs no probe, so only
+    # pay for enumeration when a non-CPU device was actually requested.
+    if device.split(".")[0].upper() != "CPU":
+        assert device in Core().available_devices, (
             "Specified device "
             + device
             + " is not in the list of OpenVINO Available Devices"
         )
-    else:
-        device = "CPU"
     return device
 
 

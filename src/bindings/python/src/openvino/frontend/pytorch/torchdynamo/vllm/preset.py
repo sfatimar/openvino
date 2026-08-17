@@ -9,6 +9,7 @@ vllm/ subpackage so that the generic torchdynamo backend stays free of
 vLLM-specific knowledge.
 """
 
+import os
 from typing import Optional, Any
 
 
@@ -51,6 +52,32 @@ _PRESET_CONFIG = {
     "DYNAMIC_QUANTIZATION_GROUP_SIZE": 32,
 }
 
+# Env escapes for the config defaults above. Without these the preset wins over
+# the env var: merge_preset_config() runs setdefault() before
+# compile_hooks.apply_kv_cache_config_defaults() ever reads OV_KV_CACHE_PRECISION,
+# so the env var is silently ignored. That matters on AVX2-only CPUs, where the
+# PagedAttention kernel accepts f32 only (executor_pa.cpp:2558) and the bf16
+# default makes the backend unusable.
+_PRESET_CONFIG_ENV = {
+    "KV_CACHE_PRECISION": "OV_KV_CACHE_PRECISION",
+    "INFERENCE_PRECISION_HINT": "OV_INFERENCE_PRECISION_HINT",
+    "DYNAMIC_QUANTIZATION_GROUP_SIZE": "OV_DYNAMIC_QUANTIZATION_GROUP_SIZE",
+}
+
+
+def _preset_config_value(key: str) -> Any:
+    """Preset default for `key`, overridden by its env var when one is set."""
+    default = _PRESET_CONFIG[key]
+    raw = os.environ.get(_PRESET_CONFIG_ENV.get(key, ""))
+    if not raw:
+        return default
+    if isinstance(default, int):
+        try:
+            return int(raw)
+        except ValueError:
+            return default
+    return raw
+
 
 def is_vllm_preset(options) -> bool:
     """True iff options["vllm"] is set to a truthy value."""
@@ -73,8 +100,8 @@ def merge_preset_config(base: Optional[dict]) -> dict:
     """Return a dict with the preset OV-config defaults filled in. Caller-supplied
     entries in `base` take priority."""
     out = dict(base or {})
-    for k, v in _PRESET_CONFIG.items():
-        out.setdefault(k, v)
+    for k in _PRESET_CONFIG:
+        out.setdefault(k, _preset_config_value(k))
     return out
 
 

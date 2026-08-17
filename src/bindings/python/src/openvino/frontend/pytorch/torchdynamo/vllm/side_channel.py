@@ -117,6 +117,34 @@ def _pa_auto_detect_kv_geom(ctx, meta_layer_name, placeholder_layer_name=None):
 
 
 
+def _kv_block_size(kv_cache):
+    """Block size of a vLLM per-layer KV cache, by layout.
+
+    CPU (cpu_attn.py:101) is 4-D (num_blocks, num_kv_heads, block_size,
+    2 * head_size) with block_size on axis 2. The 5-D layout
+    (2, num_blocks, num_kv_heads, block_size, head_size) has it on axis 3.
+    """
+    if kv_cache.ndim == 4:
+        return int(kv_cache.shape[2])
+    if kv_cache.ndim >= 5:
+        return int(kv_cache.shape[3])
+    return 16
+
+
+def _split_kv(kv_cache):
+    """Return (key_cache, value_cache) views for either KV cache layout.
+
+    vLLM's CPU backend concatenates K and V on the last axis of a 4-D tensor
+    (cpu_attn.py:101); other backends stack them on a leading axis of a 5-D
+    tensor. Calling unbind(0) on the 4-D form unbinds the *block* axis, which
+    raises and — if the caller swallows it — silently drops the real KV cache.
+    """
+    if kv_cache.ndim == 4:
+        head_size = kv_cache.shape[-1] // 2
+        return kv_cache[..., :head_size], kv_cache[..., head_size:]
+    return kv_cache.unbind(0)
+
+
 _PA_FIELDS = (
     "key_cache", "value_cache", "past_lens", "subsequence_begins",
     "block_indices", "block_indices_begins", "max_context_len",
@@ -324,7 +352,8 @@ def _bind_paged_attention_side_channel(compiled):
                     # vLLM 0.25 CPU KV cache is rank-4
                     # [num_blocks, num_kv_heads, block_size, 2*head_size]
                     # with K/V interleaved along the last dim. unbind(0)
-                    # picks the wrong axis; view + chunk splits correctly.
+                    # picks the wrong axis; view + chunk splits correctly --
+                    # this mirrors vLLM's own split at cpu_attn.py:361.
                     if kv_cache.ndim == 4:
                         _nb, _hk, _bs, _last = kv_cache.shape
                         _view = kv_cache.view(_nb, _hk, _bs * 2, _last // 2)
@@ -371,7 +400,17 @@ def _bind_paged_attention_side_channel(compiled):
                 # KV buffers are kept alive in _pa_kv_ovt_cache; no need to
                 # stash an extra list in the result dict.
             except Exception:
-                pass
+                # Do not fail silently here: falling through leaves OV bound to
+                # the one-block dummy below while block indices still address
+                # the real cache, which corrupts the heap inside PA rather than
+                # raising anywhere near the cause.
+                logger.warning(
+                    "PA side channel: could not bind KV cache for layer %s "
+                    "(shape=%s); falling back to dummy KV",
+                    meta_layer_name,
+                    tuple(kv_cache.shape) if kv_cache is not None else None,
+                    exc_info=True,
+                )
         if key_cache_np is None:
             # Fallback dummy — must provide (1, Hk, block_size, S) that match
             # what the PA op will see at real runtime. Otherwise CPU PA caches
@@ -425,7 +464,11 @@ def _bind_paged_attention_side_channel(compiled):
                 seq_lens = getattr(attn_meta, "seq_lens", None)
                 block_table = getattr(attn_meta, "block_table", None)
                 if block_table is not None and seq_lens is not None:
-                    block_size = int(kv_cache.shape[3]) if kv_cache.ndim >= 5 else 16
+                    # Must come from the layout, not a literal: the 4-D CPU
+                    # cache carries block_size on axis 2, and assuming 16 here
+                    # computes block indices at half stride against vLLM's real
+                    # table -- out-of-bounds writes inside InferRequest::infer().
+                    block_size = _kv_block_size(kv_cache)
                     _bi_key = (id(block_table), block_size)
                     _bi_cached = _bi_cache.get(_bi_key)
                     if _bi_cached is not None:
