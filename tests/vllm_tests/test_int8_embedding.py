@@ -4,7 +4,7 @@
 
 """Verify the input embedding looks up the checkpoint's int8 table when it still matches the live weight.
 
-Checks the lookup is bit-identical to the dense one, the stale fallback, and the per-device default.
+Checks the lookup is bit-identical to the dense one, the stale fallback, the per-device default, and the release.
 """
 
 import os
@@ -62,6 +62,9 @@ def _model(dtype=torch.float16, asym=True, device="GPU", stale=False):
 @pytest.fixture(autouse=True)
 def clean_state(monkeypatch):
     monkeypatch.delenv("OV_INT8_EMBEDDING", raising=False)
+    monkeypatch.setattr(plugin, "_baked_storages", set())
+    monkeypatch.setattr(plugin, "_released_storages", set())
+    monkeypatch.setattr(plugin, "_superseded_storages", set())
 
 
 def _ids():
@@ -89,6 +92,7 @@ def test_stale_table_keeps_dense_lookup():
 
     assert isinstance(model.embed_tokens.quant_method, UnquantizedEmbeddingMethod)
     assert model.embed_tokens._ov_q_weight is None
+    assert not plugin._superseded_storages
 
 
 @pytest.mark.precommit
@@ -100,6 +104,7 @@ def test_reinstall_after_stale_update_falls_back():
     plugin._install_compressed_embeddings(model)
 
     assert isinstance(model.embed_tokens.quant_method, UnquantizedEmbeddingMethod)
+    assert not plugin._superseded_storages
 
 
 @pytest.mark.precommit
@@ -112,3 +117,19 @@ def test_default_per_device(monkeypatch, device, env, expected):
     model, _ = _model(device=device)
     plugin._install_compressed_embeddings(model)
     assert isinstance(model.embed_tokens.quant_method, plugin._CompressedEmbeddingMethod) is expected
+
+
+@pytest.mark.precommit
+def test_dense_table_released_lookup_unaffected():
+    model, dense = _model()
+    plugin._install_compressed_embeddings(model)
+    weight = model.embed_tokens.weight
+
+    plugin._release_baked_weights(model)
+
+    assert weight.untyped_storage().data_ptr() in plugin._released_storages
+    # Released pages read as zeros, but the lookup never touches them.
+    page_bytes = 2 * os.sysconf("SC_PAGE_SIZE")
+    assert int(weight.count_nonzero()) * weight.element_size() <= page_bytes
+    ids = _ids()
+    assert torch.equal(model.embed_tokens(ids), torch.nn.functional.embedding(ids, dense))

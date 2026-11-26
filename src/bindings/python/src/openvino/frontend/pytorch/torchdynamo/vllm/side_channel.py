@@ -18,12 +18,12 @@ import torch
 from openvino.frontend.pytorch.utils import pt_to_ov_type_map
 
 if TYPE_CHECKING:
-    from openvino import CompiledModel, Tensor, Type
+    from openvino import CompiledModel, RemoteTensor, Tensor, Type
 
 logger = logging.getLogger(__name__)
 
-# Per-layer KV-cache ov.Tensor wrappers, persisted across torch.compile invocations.
-_pa_kv_ovt_cache: "dict[tuple[int, str | None], tuple[Tensor, Tensor, np.ndarray, np.ndarray]]" = {}
+# Per-layer KV-cache ov.Tensor wrappers, persisted across torch.compile invocations; on GPU, device tensors.
+_pa_kv_ovt_cache: "dict[tuple[int, str | None], tuple[Any, Any, Any, Any]]" = {}
 
 
 def _ov_tensor_over_torch(tensor: torch.Tensor, param_dt: "Type", _ov: ModuleType) -> "Tensor | None":
@@ -36,6 +36,35 @@ def _ov_tensor_over_torch(tensor: torch.Tensor, param_dt: "Type", _ov: ModuleTyp
     npv = (tensor.view(torch.float16).numpy()
            if tensor.dtype == torch.bfloat16 else tensor.numpy())
     return _ov.Tensor(npv, _ov.Shape(list(tensor.shape)), param_dt)
+
+
+_on_gpu_cache: dict[int, bool] = {}  # id(compiled) -> bool
+
+
+def _on_gpu(compiled: "CompiledModel") -> bool:
+    key = id(compiled)
+    if key not in _on_gpu_cache:
+        devices = compiled.get_property("EXECUTION_DEVICES")
+        _on_gpu_cache[key] = any(str(d).startswith("GPU") for d in devices)
+    return _on_gpu_cache[key]
+
+
+def _device_kv_tensors(num_blocks: int, compiled: "CompiledModel", port_names: "tuple[str, str]",
+                       _ov: ModuleType) -> "list[RemoteTensor]":
+    """A layer's key/value cache in device memory, in the type and block shape the GPU plugin chose at compile.
+
+    vLLM's buffers are shape-only placeholders here (plugin._patch_device_kv_cache); no zero fill, since
+    PagedAttention writes each block before reading it.
+    """
+    from openvino.frontend.pytorch.torchdynamo.compile import get_core
+    device = next(str(d) for d in compiled.get_property("EXECUTION_DEVICES"))
+    context = get_core().get_default_context(device)
+    tensors = []
+    for name in port_names:
+        port = next(p for p in compiled.inputs if name in p.get_names())
+        block_dims = [d.get_length() for d in list(port.get_partial_shape())[1:]]
+        tensors.append(context.create_tensor(port.get_element_type(), _ov.Shape([num_blocks] + block_dims), {}))
+    return tensors
 
 
 # OV CPU PagedAttention requires block_size 32; larger multiples are re-blocked to it.
@@ -301,6 +330,16 @@ def _bind_paged_attention_side_channel(compiled: "CompiledModel") -> dict[str, A
                 cached = _pa_kv_ovt_cache.get(cache_key)
                 if cached is not None:
                     key_cache_ovt, value_cache_ovt, key_cache_np, value_cache_np = cached
+                elif _on_gpu(compiled):
+                    import openvino as _ov
+                    key_cache_ovt, value_cache_ovt = _device_kv_tensors(
+                        int(kv_cache.shape[0]), compiled,
+                        (fields.get("key_cache", f"__pa__{layer_name}__key_cache"),
+                         fields.get("value_cache", f"__pa__{layer_name}__value_cache")),
+                        _ov)
+                    # Device tensors have no host view; the *_np slots only mark the cache bound.
+                    key_cache_np, value_cache_np = key_cache_ovt, value_cache_ovt
+                    _pa_kv_ovt_cache[cache_key] = (key_cache_ovt, value_cache_ovt, key_cache_np, value_cache_np)
                 else:
                     # The rank-4 CPU KV cache holds K then V as two contiguous halves; unbind(0) is the wrong axis.
                     if kv_cache.ndim == 4:
@@ -590,5 +629,5 @@ def _bind_gdn_side_channel(compiled: "CompiledModel") -> tuple[dict[str, Any], C
 def clear_caches() -> None:
     """Drop every per-model binding cache: their id() keys are reused once the models are freed."""
     for cache in (_pa_kv_ovt_cache, _pa_sliding_window_cache, _pa_layer_static_cache, _pa_layout_cache,
-                  _gdn_layout_cache):
+                  _gdn_layout_cache, _on_gpu_cache):
         cache.clear()

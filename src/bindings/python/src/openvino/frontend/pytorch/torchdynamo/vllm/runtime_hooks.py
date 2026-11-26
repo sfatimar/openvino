@@ -17,12 +17,32 @@ from .side_channel import _bind_gdn_side_channel, _bind_paged_attention_side_cha
 # Per-InferRequest caches for the OV_FAST_INFER fast path.
 _fastinfer_port_cache: dict[int, list[ConstOutput]] = {}
 _fastinfer_bound_ids: dict[int, list[list[Any]]] = {}   # id(req) -> [[val_id, ov_tensor_ref], ...] per port
+_device_bound: dict[int, dict[str, Any]] = {}          # id(req) -> {port name: RemoteTensor set on it}
 
 
 def clear_caches() -> None:
     """Drop the fast-infer caches: their id() keys are reused once the objects are freed."""
-    for cache in (_fastinfer_port_cache, _fastinfer_bound_ids):
+    for cache in (_fastinfer_port_cache, _fastinfer_bound_ids, _device_bound):
         cache.clear()
+
+
+def _bind_device_tensors(req: InferRequest, call_kwargs: dict[ConstOutput, Any]) -> dict[ConstOutput, Any]:
+    """set_tensor the device-resident inputs (the GPU KV cache) once, by port name; return the host rest.
+
+    req.infer(dict) and set_tensor(port, ...) take host tensors only; a bound RemoteTensor stays bound across infers.
+    """
+    import openvino as _ov
+    bound = _device_bound.setdefault(id(req), {})
+    host = {}
+    for port, val in call_kwargs.items():
+        if isinstance(val, _ov.RemoteTensor):
+            name = port.get_any_name()
+            if bound.get(name) is not val:
+                req.set_tensor(name, val)
+                bound[name] = val
+        else:
+            host[port] = val
+    return host
 
 
 # Returned by run_pa_infer: skip this infer and run eager.
@@ -129,6 +149,8 @@ def infer_with_pa(
     Falls back to plain req.infer only if binding fails. Inference errors propagate: inference already advanced the KV
     cache and GDN state, so a rerun would advance them twice.
     """
+    call_kwargs = _bind_device_tensors(req, call_kwargs)
+    device_bound = _device_bound[id(req)]
     if os.environ.get("OV_FAST_INFER", "0") == "0":
         return req.infer(call_kwargs, share_inputs=True, share_outputs=True)
 
@@ -147,6 +169,8 @@ def infer_with_pa(
             _fastinfer_bound_ids[_req_key] = _bound
         for _pi_idx, _port in enumerate(_ports):
             _val = call_kwargs.get(_port)
+            if _val is None and _port.get_any_name() in device_bound:
+                continue  # device-resident, bound by _bind_device_tensors
             if _val is None:
                 raise RuntimeError("call_kwargs missing port")
             _val_id = id(_val)

@@ -326,7 +326,7 @@ def retype_kv_cache_parameters(om: "Model | None", et_name: str) -> int:
     Otherwise the plugin splices a Convert after them and PA's in-place cache writes land in its temporary.
     """
     from openvino import Type
-    target = {"bf16": Type.bf16, "f16": Type.f16, "f32": Type.f32}.get(et_name)
+    target = {"bf16": Type.bf16, "f16": Type.f16, "f32": Type.f32, "dynamic": Type.dynamic}.get(et_name)
     if om is None or target is None:
         return 0
     changed = 0
@@ -345,7 +345,14 @@ def retype_kv_cache_parameters(om: "Model | None", et_name: str) -> int:
 
 def apply_post_config(config: dict[str, Any], device: str, options: Mapping[str, Any] | None, om: "Model") -> None:
     """Fill the vLLM KV-cache and FC-quantization defaults into a CPU compile config; caller entries win."""
-    if device != "CPU" or not _preset.is_vllm_preset(options):
+    if not _preset.is_vllm_preset(options):
+        return
+    if device.startswith("GPU"):
+        # The GPU plugin types the KV cache from KV_CACHE_PRECISION (compressed by default); a model-dtype
+        # Parameter it can't use gets a Convert, and ConvertPagedAttnInputs then leaves its shape dynamic.
+        retype_kv_cache_parameters(om, "dynamic")
+        return
+    if device != "CPU":
         return
     for key, value in _preset._PRESET_CONFIG.items():
         config.setdefault(key, value)

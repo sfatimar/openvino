@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import torch
+    from openvino import CompiledModel
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +148,7 @@ def _install_compressed_embeddings(model: Any) -> None:
     """Point each input embedding at its compressed checkpoint table; runs before _install_ov_lm_head.
 
     int4 (dense weight never loaded) always; int8 while it matches the live weight, by default on GPU only.
+    The dense table becomes released (int4) or superseded (int8), for the compile guard and weight release.
     """
     try:
         import torch
@@ -165,18 +167,22 @@ def _install_compressed_embeddings(model: Any) -> None:
                 or getattr(module, "tp_size", 1) > 1:
             continue
         base = getattr(module.quant_method, "base", module.quant_method)
+        dense_ptr = module.weight.untyped_storage().data_ptr()
         int4 = getattr(module, "_ov_nncf_int4", None)
         if int4 is not None:
             stored, scale, zero_point = int4
             _set_embedding_table(module, base, 4, stored, scale.reshape(scale.shape[0], -1), zero_point)
+            _released_storages.add(dense_ptr)
             logger.info("[OV plugin] embedding %s looks up its int4 checkpoint table",
                         tuple(module.weight.shape))
             continue
         int8 = _match_int8(stash, module.weight) if int8_enabled and not module.weight.is_meta else None
         if int8 is None:
             _set_embedding_table(module, base, None)
+            _superseded_storages.discard(dense_ptr)
             continue
         _set_embedding_table(module, base, 8, *int8)
+        _superseded_storages.add(dense_ptr)
         logger.info("[OV plugin] embedding %s looks up its int8 checkpoint table",
                     tuple(module.weight.shape))
 
@@ -216,6 +222,8 @@ def _install_ov_lm_head(model: "torch.nn.Module") -> None:
                     logger.warning("[OV plugin] lm_head OV compile failed: %s", _e)
             # Unread on the oneDNN path; drop the ~V*H bytes it holds.
             model._ov_nncf_int8_weights = {}
+            # Off OV, lm_head still reads its torch weight (_release_baked_weights).
+            model._ov_lm_head_on_ov = fn is not None
             if fn is not None:
                 lm_head.cpu_linear = fn
             elif int4 is None:
@@ -392,6 +400,124 @@ def _rebuild_ov_model(runner: Any, model: "torch.nn.Module") -> None:
         runner.warming_up_model()
 
 
+# Storages of host tensors an OV compile baked in, and those _release_baked_weights returned to the OS.
+_baked_storages: set[int] = set()
+_released_storages: set[int] = set()
+# Dense weights nothing reads any more (an embedding now looking up int8 rows).
+_superseded_storages: set[int] = set()
+
+_MADV_DONTNEED = 4
+
+
+def _host_storages(gm: "torch.fx.GraphModule", args: "Sequence[Any]") -> set[int]:
+    """Storage addresses of the host tensors an FX graph holds or is called with."""
+    import torch
+    tensors = list(gm.parameters()) + list(gm.buffers())
+    for node in gm.graph.nodes:
+        if node.op == "get_attr":
+            obj: Any = gm
+            for part in str(node.target).split("."):
+                obj = getattr(obj, part, None)
+            tensors.append(obj)
+    tensors += list(args)
+    return {t.untyped_storage().data_ptr() for t in tensors
+            if isinstance(t, torch.Tensor) and t.device.type == "cpu" and not t.is_meta}
+
+
+def _patch_openvino_compile() -> None:
+    """Track the weights each OV compile bakes in, and refuse released ones.
+
+    Released weights read as zeros, so a compile reading them would serve wrong tokens silently.
+    """
+    from openvino.frontend.pytorch.torchdynamo import execute
+    if getattr(execute, "_ov_plugin_compile_patched", False):
+        return
+    _orig_compile = execute.openvino_compile
+
+    def _patched_compile(gm: "torch.fx.GraphModule", *args: Any, **kwargs: Any) -> Any:
+        storages = _host_storages(gm, args)
+        if storages & _released_storages:
+            raise RuntimeError(
+                "OpenVINO vLLM backend: a new OV compile needs torch weights that were released "
+                "after the GPU compile; set OV_RELEASE_TORCH_WEIGHTS=0 to keep them")
+        compiled = _orig_compile(gm, *args, **kwargs)
+        _baked_storages.update(storages)
+        return compiled
+
+    execute.openvino_compile = _patched_compile
+    execute._ov_plugin_compile_patched = True
+
+
+def _release_baked_weights(model: "torch.nn.Module") -> None:
+    """madvise away the host copy of every torch weight an OV GPU compile baked in (or an int8 embedding superseded).
+
+    Tensors keep their object and address, so dynamo guards and the structural cache still match; content-keyed
+    constants (<= _KEY_CONTENT_NUMEL) and weights torch still reads (lm_head off OV) stay.
+    """
+    import ctypes
+    import torch
+    from openvino.frontend.pytorch.torchdynamo.execute import _KEY_CONTENT_NUMEL
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    page = os.sysconf("SC_PAGE_SIZE")
+    keep = set()
+    lm_head = _find_lm_head(model)
+    if lm_head is not None and not getattr(model, "_ov_lm_head_on_ov", False) \
+            and isinstance(getattr(lm_head, "weight", None), torch.Tensor):
+        keep.add(lm_head.weight.untyped_storage().data_ptr())
+    freed = 0
+    for tensor in itertools.chain(model.parameters(), model.buffers()):
+        if tensor.device.type != "cpu" or tensor.is_meta:
+            continue
+        storage = tensor.untyped_storage()
+        ptr = storage.data_ptr()
+        if (ptr not in _baked_storages and ptr not in _superseded_storages) \
+                or ptr in keep or ptr in _released_storages \
+                or tensor.numel() <= _KEY_CONTENT_NUMEL:
+            continue
+        # Whole pages only: the first and last may be shared with other allocations.
+        start = -(-ptr // page) * page
+        end = (ptr + storage.nbytes()) // page * page
+        if end > start and libc.madvise(start, end - start, _MADV_DONTNEED) == 0:
+            freed += end - start
+            _released_storages.add(ptr)
+    logger.info("[OV plugin] released %.2f GiB of torch weights the OV GPU model no longer reads", freed / 2**30)
+
+
+def _forget_released(model: "torch.nn.Module") -> None:
+    """A full weight reload rewrote every released tensor, so OV may read them again."""
+    if not _released_storages:
+        return
+    for tensor in itertools.chain(model.parameters(), model.buffers()):
+        _released_storages.discard(tensor.untyped_storage().data_ptr())
+
+
+def _release_enabled(vllm_config: Any) -> bool:
+    """On by default on OV GPU only: on CPU the OV model may share the torch weights' memory."""
+    return _on_ov_gpu(vllm_config) and os.environ.get("OV_RELEASE_TORCH_WEIGHTS", "1") != "0"
+
+
+def _patch_release_weights() -> None:
+    """Release the baked torch weights once vLLM's warmup has compiled the serving model."""
+    try:
+        from vllm.v1.worker.cpu_worker import CPUWorker
+    except Exception as _e:
+        logger.debug("[OV plugin] weight release patch skipped: %s", _e)
+        return
+    if getattr(CPUWorker, "_ov_plugin_release_patched", False):
+        return
+    _orig_warm_up = CPUWorker.compile_or_warm_up_model
+
+    def _patched_warm_up(self: Any, *args: Any, **kwargs: Any) -> Any:
+        result = _orig_warm_up(self, *args, **kwargs)
+        if _release_enabled(getattr(self, "vllm_config", None)):
+            _release_baked_weights(self.model_runner.get_model())
+        return result
+
+    CPUWorker.compile_or_warm_up_model = _patched_warm_up
+    CPUWorker._ov_plugin_release_patched = True
+
+
 def _patch_cpu_model_runner() -> None:
     try:
         from vllm.v1.worker.cpu_model_runner import CPUModelRunner
@@ -475,6 +601,7 @@ def _patch_cpu_model_runner() -> None:
             logger.debug("[OV plugin] affinity widen skipped: %s", _e)
 
         _raise_dynamo_cache_limit()
+        _patch_openvino_compile()
         _warn_if_spinning_single_process()
 
         logger.info("[OV plugin] Compiling model with torch.compile backend=openvino")
@@ -488,9 +615,12 @@ def _patch_cpu_model_runner() -> None:
         self.model._ov_compile_options = options
         _compile_ov_forward(self.model, options)
 
-        # lm_head runs outside forward(), and disabling onednn left it on plain F.linear.
         _install_compressed_embeddings(self.model)
+        # lm_head runs outside forward(), and disabling onednn left it on plain F.linear.
         _install_ov_lm_head(self.model)
+        if _release_enabled(self.vllm_config):
+            # Before the compile, so the dense embedding table is not in its peak either.
+            _release_baked_weights(self.model)
 
     CPUModelRunner.load_model = patched_load_model
     CPUModelRunner._ov_plugin_patched = True
@@ -512,7 +642,10 @@ def _patch_reload_weights() -> None:
     def patched_reload_weights(self: Any, *args: Any, **kwargs: Any) -> None:
         _orig_reload_weights(self, *args, **kwargs)
         if _ov_active(self):
+            _forget_released(self.model)
             _rebuild_ov_model(self, self.model)
+            if _release_enabled(getattr(self, "vllm_config", None)):
+                _release_baked_weights(self.model)
 
     CPUModelRunner.reload_weights = patched_reload_weights
     CPUModelRunner._ov_plugin_reload_patched = True
@@ -536,12 +669,15 @@ def _patch_worker_update_weights() -> None:
         model_runner = getattr(self, "model_runner", None)
         if model_runner is not None and _ov_active(model_runner):
             model = model_runner.get_model()
-            if hasattr(model, "modules") and any(
-                    getattr(m, "_ov_nncf_int4", None) is not None for m in model.modules()):
-                # The dense table was never loaded, so a partial sync would rebuild from garbage.
+            if hasattr(model, "parameters") and any(
+                    tensor.untyped_storage().data_ptr() in _released_storages
+                    for tensor in itertools.chain(model.parameters(), model.buffers())
+                    if tensor.device.type == "cpu" and not tensor.is_meta):
+                # A sync may cover only some weights, so the rest would rebuild from garbage.
                 raise RuntimeError(
-                    "OpenVINO vLLM backend: weight updates need the dense embedding, which an int4 "
-                    "embedding never loads; set OV_INT4_EMBEDDING=0 to load it")
+                    "OpenVINO vLLM backend: weight updates need the torch weights, which were "
+                    "released after the GPU compile (OV_RELEASE_TORCH_WEIGHTS=0 keeps them) or, "
+                    "for an int4 embedding, never loaded (OV_INT4_EMBEDDING=0 loads them)")
             _rebuild_ov_model(model_runner, model)
 
     CPUWorker.finish_weight_update = patched_finish_weight_update
@@ -628,6 +764,36 @@ def _sgl_kernel_disabled() -> Iterator[None]:
 # KV-cache GiB for OV runs with no size set; vLLM's default fills node memory and OOMs on shared nodes.
 _OV_DEFAULT_KVCACHE_GIB = 4
 
+# Cap (GiB) on the OV GPU KV cache with no size set: OV allocates it up front, and on an iGPU
+# gpu_memory_utilization alone would take half the host memory. 1 GiB holds ~16 2k-token sequences of a 1B model.
+_OV_DEFAULT_GPU_KVCACHE_GIB = 1
+
+# The GPU PagedAttention kernel's block size (cldnn::paged_attention::block_size).
+_OV_GPU_BLOCK_SIZE = 16
+
+
+def _check_device_kv_config(vllm_config: Any) -> None:
+    """Set the GPU kernel's block size, and refuse features that reach the KV cache from the host.
+
+    The KV size is left unset: it comes from device memory (_patch_device_kv_cache).
+    """
+    cache_config = vllm_config.cache_config
+    if cache_config.block_size != _OV_GPU_BLOCK_SIZE:
+        logger.info("[OV plugin] block_size %s -> %d for the OpenVINO GPU PagedAttention kernel",
+                    cache_config.block_size, _OV_GPU_BLOCK_SIZE)
+        cache_config.block_size = _OV_GPU_BLOCK_SIZE
+    unsupported = []
+    if getattr(vllm_config, "kv_transfer_config", None) is not None:
+        unsupported.append("kv_transfer_config (KV connectors)")
+    if getattr(cache_config, "kv_offloading_size", None):
+        unsupported.append("kv_offloading_size")
+    if getattr(vllm_config.model_config, "enable_sleep_mode", False):
+        unsupported.append("enable_sleep_mode")
+    if unsupported:
+        raise ValueError(
+            "OpenVINO vLLM backend: the GPU KV cache lives in device memory owned by OpenVINO, "
+            "so these features, which access it from the host, are unsupported: " + ", ".join(unsupported))
+
 
 def _patch_kv_cache_default() -> None:
     """Default kv_cache_memory_bytes for OV runs, where vLLM applies VLLM_CPU_KVCACHE_SPACE."""
@@ -643,6 +809,9 @@ def _patch_kv_cache_default() -> None:
     def _patched(cls: Any, vllm_config: Any) -> None:
         _orig(cls, vllm_config)
         cache_config = getattr(vllm_config, "cache_config", None)
+        if cache_config is not None and _on_ov_gpu(vllm_config):
+            _check_device_kv_config(vllm_config)
+            return
         if (cache_config is None or cache_config.kv_cache_memory_bytes is not None
                 or not _ov_requested(vllm_config)):
             return
@@ -654,6 +823,133 @@ def _patch_kv_cache_default() -> None:
 
     CpuPlatform.check_and_update_config = classmethod(_patched)
     CpuPlatform._ov_plugin_kv_default_patched = True
+
+
+def _ov_device(vllm_config: Any) -> str:
+    """The OV device requested through compilation_config (see _ov_user_options)."""
+    return str(_ov_user_options(vllm_config).get("device", "CPU"))
+
+
+def _on_ov_gpu(vllm_config: Any) -> bool:
+    return _ov_requested(vllm_config) and _ov_device(vllm_config).startswith("GPU")
+
+
+def _serving_compiled_model() -> "CompiledModel | None":
+    """The compiled OV model with PagedAttention inputs, which the warmup builds before vLLM sizes the KV cache."""
+    from openvino.frontend.pytorch.torchdynamo import execute
+    from openvino.frontend.pytorch.torchdynamo.vllm.runtime_hooks import has_pa_inputs
+    candidates = [c for c, _req in execute.structural_cache.values()] + list(execute.compiled_cache.values())
+    return next((c for c in candidates if has_pa_inputs(c)), None)
+
+
+def _ov_kv_block_bytes(compiled: "CompiledModel") -> int:
+    """Bytes of one KV block across all layers, in the precision and block shape the device plugin chose."""
+    import numpy as np
+    from openvino.frontend.pytorch.torchdynamo.vllm.compile_hooks import _is_kv_cache_port
+    total = 0
+    for port in compiled.inputs:
+        if _is_kv_cache_port(port):
+            block_dims = [d.get_length() for d in list(port.get_partial_shape())[1:]]
+            total += int(np.prod(block_dims)) * port.get_element_type().size
+    return total
+
+
+def _patch_device_kv_cache() -> None:
+    """On an OV GPU device, OV owns the KV cache in device memory (side_channel._device_kv_tensors).
+
+    vLLM still manages the blocks; its own KV buffers become meta placeholders,
+    and the KV size comes from device memory.
+    """
+    try:
+        import torch
+        from vllm.v1.worker.cpu_worker import CPUWorker
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+    except Exception as _e:
+        logger.debug("[OV plugin] device KV patch skipped: %s", _e)
+        return
+
+    if getattr(GPUModelRunner, "_ov_plugin_device_kv_patched", False):
+        return
+
+    _orig_alloc = GPUModelRunner._allocate_kv_cache_tensors
+
+    def _patched_alloc(self: Any, kv_cache_config: Any, *args: Any, **kwargs: Any) -> Any:
+        if not _on_ov_gpu(getattr(self, "vllm_config", None)):
+            return _orig_alloc(self, kv_cache_config, *args, **kwargs)
+        real_zeros = torch.zeros
+        # Mamba / Gated DeltaNet state stays in vLLM's host buffers, so a buffer a state layer shares stays real.
+        # One decision per torch.zeros call, in _orig_alloc's order; packed tensors share one.
+        from vllm.v1.kv_cache_interface import MambaSpec
+        state_layers = {name for group in kv_cache_config.kv_cache_groups
+                        if isinstance(group.kv_cache_spec, MambaSpec) for name in group.layer_names}
+        tensors = kv_cache_config.kv_cache_tensors
+        packed_real = any(not state_layers.isdisjoint(t.shared_by) for t in tensors if t.block_stride > 0)
+        real_list = [not state_layers.isdisjoint(t.shared_by) for t in tensors if t.block_stride <= 0]
+        if any(t.block_stride > 0 for t in tensors):
+            first_packed = next(i for i, t in enumerate(tensors) if t.block_stride > 0)
+            real_list.insert(sum(1 for t in tensors[:first_packed] if t.block_stride <= 0), packed_real)
+        real = iter(real_list)
+        host_bytes = 0
+
+        def _meta_zeros(*a: Any, **kw: Any) -> "torch.Tensor":
+            nonlocal host_bytes
+            size = a[0] if a else kw.get("size")
+            if isinstance(size, int) and kw.get("dtype") == torch.int8:
+                if next(real, False):
+                    host_bytes += size
+                    return real_zeros(*a, **kw)
+                return torch.empty(size, dtype=torch.int8, device="meta")
+            return real_zeros(*a, **kw)
+
+        torch.zeros = _meta_zeros  # type: ignore[assignment]
+        try:
+            return _orig_alloc(self, kv_cache_config, *args, **kwargs)
+        finally:
+            torch.zeros = real_zeros
+            if host_bytes:
+                logger.info("[OV plugin] %.2f GiB of KV buffers kept on host for %d state layers",
+                            host_bytes / 2**30, len(state_layers))
+
+    _orig_available = CPUWorker.determine_available_memory
+
+    def _patched_available(self: Any) -> int:
+        vllm_config: Any = getattr(self, "vllm_config", None)
+        if not _on_ov_gpu(vllm_config):
+            return _orig_available(self)
+        self.model_runner.warming_up_model()
+        compiled = _serving_compiled_model()
+        if compiled is None:
+            raise RuntimeError("OpenVINO vLLM backend: the warmup compiled no PagedAttention model")
+        ov_block_bytes = _ov_kv_block_bytes(compiled)
+
+        from openvino.frontend.pytorch.torchdynamo.compile import get_core
+        core = get_core()
+        device = _ov_device(vllm_config)
+        explicit = vllm_config.cache_config.kv_cache_memory_bytes
+        if explicit is not None:
+            budget = explicit
+        else:
+            # Device memory not yet used by the compiled model (weights, buffers).
+            total = core.get_property(device, "GPU_DEVICE_TOTAL_MEM_SIZE")
+            used = sum(core.get_property(device, "GPU_MEMORY_STATISTICS").values())
+            budget = int(total * vllm_config.cache_config.gpu_memory_utilization) - used
+            if str(core.get_property(device, "DEVICE_TYPE")).endswith("INTEGRATED"):
+                # An iGPU's device memory is host memory: leave the host its share.
+                import psutil
+                budget = min(budget, int(psutil.virtual_memory().available
+                                         * vllm_config.cache_config.gpu_memory_utilization))
+            budget = min(budget, _OV_DEFAULT_GPU_KVCACHE_GIB << 30)
+        num_blocks = max(budget, 0) // ov_block_bytes
+
+        # vLLM derives num_blocks from its own (model-dtype) page size; report what yields exactly num_blocks.
+        vllm_block_bytes = sum(spec.page_size_bytes for spec in self.model_runner.get_kv_cache_spec().values())
+        logger.info("[OV plugin] KV cache on %s: %d blocks, %.2f GiB of device memory",
+                    device, num_blocks, num_blocks * ov_block_bytes / 2**30)
+        return num_blocks * vllm_block_bytes
+
+    GPUModelRunner._allocate_kv_cache_tensors = _patched_alloc
+    CPUWorker.determine_available_memory = _patched_available
+    GPUModelRunner._ov_plugin_device_kv_patched = True
 
 
 def _patch_omp_wait_policy() -> None:
@@ -767,4 +1063,6 @@ def register() -> None:
     _patch_cpu_model_runner()
     _patch_reload_weights()
     _patch_worker_update_weights()
+    _patch_release_weights()
+    _patch_device_kv_cache()
     _patch_lazy_kv_cache()
